@@ -474,6 +474,8 @@ struct UTPSocket {
 	uint32 reply_micro;
 
 	uint64 last_got_packet;
+	// The latest send time, in microseconds, of a packet the peer has acknowledged
+	uint64 latest_acked_send_time;
 	uint64 last_sent_packet;
 	uint64 last_measured_delay;
 
@@ -607,6 +609,7 @@ struct UTPSocket {
 	}
 
 	// If we can, decay max window, returns true if we actually did so
+	void resend_lost_packets();
 	void maybe_decay_win(uint64 current_ms)
 	{
 		if (can_decay_win(current_ms)) {
@@ -1370,6 +1373,12 @@ int UTPSocket::ack_packet(uint16 seq)
 		seq, (uint)pkt->payload, pkt->need_resend);
 	#endif
 
+	// An ACK that comes less than a round trip after a resend answers an earlier copy, so the
+	// resend's send time says nothing about what the peer has received (RFC 8985, step 2).
+	const uint min_rtt = rtt_hist.delay_base_initialized ? rtt_hist.delay_base : rtt;
+	if (pkt->transmissions == 1
+		|| utp_call_get_microseconds(this->ctx, this) - pkt->time_sent >= uint64(min_rtt) * 1000U)
+		latest_acked_send_time = std::max(latest_acked_send_time, pkt->time_sent);
 	outbuf.put(seq, NULL);
 
 	// if we never re-sent the packet, update the RTT estimate
@@ -1448,6 +1457,53 @@ size_t UTPSocket::selective_ack_bytes(uint base, const byte* mask, byte len, int
 		}
 	} while (--bits >= -1);
 	return acked_bytes;
+}
+
+// At most this many lost packets are resent per incoming ACK.
+#define MAX_LOST_RESENDS 16
+
+// A packet the peer has not acknowledged, sent well before one it has, is lost (RACK, RFC
+// 8985). This resends a packet whose later resend is lost, and gaps beyond the 32 packets a
+// selective ACK covers, which selective_ack() leaves to a timeout. A quarter of the round trip
+// tolerates reordering. A resent packet counts as sent at its resend, so it is resent again
+// only once a packet sent after that resend is acknowledged.
+void UTPSocket::resend_lost_packets()
+{
+	if (cur_window_packets == 0 || latest_acked_send_time == 0)
+		return;
+
+	const uint64 reorder_window_us = std::max<uint64>(uint64(rtt) * 1000U / 4U, 1000U);
+	if (latest_acked_send_time < reorder_window_us)
+		return;
+	const uint64 lost_before = latest_acked_send_time - reorder_window_us;
+	int resent = 0;
+	for (int i = 0; i < cur_window_packets && resent < MAX_LOST_RESENDS; ++i) {
+		OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(seq_nr - cur_window_packets + i);
+		if (pkt == NULL || pkt->need_resend)
+			continue; // acked, or already queued for resending
+		if (pkt->transmissions == 0)
+			break; // not sent yet
+		if (pkt->time_sent >= lost_before) {
+			// first transmissions go out in sequence order, so later ones are newer still
+			if (pkt->transmissions == 1)
+				break;
+			continue;
+		}
+		const uint16 v = (seq_nr - cur_window_packets + i) & ACK_NR_MASK;
+		// used in parse_log.py
+		log(UTP_LOG_NORMAL, "Packet %u lost. Resending", v);
+		#ifdef _DEBUG
+		++_stats.rexmit;
+		#endif
+		send_packet(pkt);
+		++resent;
+		// selective_ack() resends from fast_resend_seq_nr on: not this packet again
+		if (((v - fast_resend_seq_nr) & ACK_NR_MASK) <= OUTGOING_BUFFER_MAX_SIZE)
+			fast_resend_seq_nr = (v + 1) & ACK_NR_MASK;
+	}
+
+	if (resent > 0)
+		maybe_decay_win(ctx->current_ms);
 }
 
 enum { MAX_EACK = 128 };
@@ -2300,6 +2356,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	if (selack_ptr != NULL) {
 		conn->selective_ack(pk_ack_nr + 2, selack_ptr, selack_ptr[-1]);
 	}
+	conn->resend_lost_packets();
 
 	// this invariant should always be true
 	assert(conn->cur_window_packets == 0 || conn->outbuf.get(conn->seq_nr - conn->cur_window_packets));
@@ -2595,6 +2652,7 @@ utp_socket*	utp_create_socket(utp_context *ctx)
 	conn->last_rcv_win			= 0;
 	conn->got_fin				= false;
 	conn->fast_timeout			= false;
+	conn->latest_acked_send_time	= 0;
 	conn->rtt					= 0;
 	conn->retransmit_timeout	= 0;
 	conn->rto_timeout			= 0;
