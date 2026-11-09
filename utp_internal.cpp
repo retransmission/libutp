@@ -444,6 +444,10 @@ struct UTPSocket {
 	bool got_fin:1;
 	// Timeout procedure
 	bool fast_timeout:1;
+	// A tail loss probe went out since the peer last acknowledged a packet
+	bool probe_sent:1;
+	// The RTT has been sampled (rtt is 0 on links faster than a millisecond)
+	bool got_rtt:1;
 
 	// max receive window for other end, in bytes
 	size_t max_window_user;
@@ -474,6 +478,8 @@ struct UTPSocket {
 	uint32 reply_micro;
 
 	uint64 last_got_packet;
+	// When the peer last acknowledged a packet, in ms
+	uint64 last_acked;
 	// The latest send time, in microseconds, of a packet the peer has acknowledged
 	uint64 latest_acked_send_time;
 	uint64 last_sent_packet;
@@ -1150,6 +1156,30 @@ void UTPSocket::check_timeouts()
 			max_window_user = PACKET_SIZE;
 		}
 
+		// Tail loss probe. The peer ACKs what arrives, so two round trips without an ACK for
+		// any packet, since the oldest packet in flight went out, mean the last packets, or the
+		// ACKs for them, were lost, and nothing later will arrive to reveal it. Packets from the
+		// peer that acknowledge nothing new do not count. Resending the oldest unacked packet
+		// makes the peer ACK either way: it fills the gap, or the peer already has it and ACKs
+		// again. (A newer packet the peer holds out of order is dropped without an ACK.) That
+		// ACK lets resend_lost_packets() resend the rest, instead of a timeout resending the
+		// whole window from a one-packet window.
+		const uint probe_timeout = 2U * rtt + 10U;
+		if (cur_window_packets > 0 && !probe_sent && got_rtt && state != CS_FIN_SENT
+			&& (int)(ctx->current_ms - rto_timeout) < 0
+			&& ctx->current_ms - last_acked >= probe_timeout) {
+			OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(seq_nr - cur_window_packets);
+			if (pkt != NULL && pkt->transmissions > 0 && !pkt->need_resend
+				&& utp_call_get_microseconds(ctx, this) - pkt->time_sent >= uint64(probe_timeout) * 1000U) {
+				probe_sent = true;
+				log(UTP_LOG_NORMAL, "Tail loss probe. Resend seq_nr:%u", (seq_nr - cur_window_packets) & ACK_NR_MASK);
+				#ifdef _DEBUG
+				++_stats.rexmit;
+				#endif
+				send_packet(pkt);
+			}
+		}
+
 		if ((int)(ctx->current_ms - rto_timeout) >= 0
 			&& rto_timeout > 0) {
 
@@ -1401,6 +1431,7 @@ int UTPSocket::ack_packet(uint16 seq)
 			rtt_hist.add_sample(ertt, ctx->current_ms);
 		}
 		rto = std::max<uint>(rtt + rtt_var * 4U, MIN_RTO);
+		got_rtt = true;
 
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "rtt:%u avg:%u var:%u rto:%u",
@@ -1419,6 +1450,8 @@ int UTPSocket::ack_packet(uint16 seq)
 	}
 	free(pkt);
 	retransmit_count = 0;
+	last_acked = ctx->current_ms;
+	probe_sent = false;
 	return 0;
 }
 
@@ -2652,6 +2685,9 @@ utp_socket*	utp_create_socket(utp_context *ctx)
 	conn->last_rcv_win			= 0;
 	conn->got_fin				= false;
 	conn->fast_timeout			= false;
+	conn->probe_sent			= false;
+	conn->got_rtt				= false;
+	conn->last_acked			= 0;
 	conn->latest_acked_send_time	= 0;
 	conn->rtt					= 0;
 	conn->retransmit_timeout	= 0;
