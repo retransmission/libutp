@@ -35,7 +35,13 @@
 #include "utp_packedsockaddr.h"
 #include "utp_internal.h"
 
-#define	TIMEOUT_CHECK_INTERVAL	500
+#define	TIMEOUT_CHECK_INTERVAL	100
+// Lower bound of the retransmission timeout, in ms. TCP's is 200 ms (RFC 6298 allows it); the
+// margin covers an ACK held until the end of the peer's receive batch.
+#define MIN_RTO 250
+// A connection is reset after 4 consecutive timeouts, but not before the backed-off timeout has
+// reached this many ms: about 31 s without an ACK, however low the RTO is.
+#define MIN_GIVE_UP_TIMEOUT 16000
 
 // number of bytes to increase max window size by, per RTT. This is
 // scaled down linearly proportional to off_target. i.e. if all packets
@@ -1185,10 +1191,11 @@ void UTPSocket::check_timeouts()
 			}
 
 			// We initiated the connection but the other side failed to respond before the rto
-			if (retransmit_count >= 4 || (state == CS_SYN_SENT && retransmit_count >= 2)) {
-				// 4 consecutive transmissions have timed out. Kill it. If we
-				// haven't even connected yet, give up after only 2 consecutive
-				// failed transmissions.
+			if ((retransmit_count >= 4 && retransmit_timeout >= MIN_GIVE_UP_TIMEOUT)
+				|| (state == CS_SYN_SENT && retransmit_count >= 2)) {
+				// 4 consecutive transmissions have timed out, the last after at least
+				// MIN_GIVE_UP_TIMEOUT. Kill it. If we haven't even connected yet, give up
+				// after only 2 consecutive failed transmissions.
 				if (state == CS_FIN_SENT)
 					state = CS_DESTROY;
 				else
@@ -1384,7 +1391,7 @@ int UTPSocket::ack_packet(uint16 seq)
 //			assert(rtt < 6000);
 			rtt_hist.add_sample(ertt, ctx->current_ms);
 		}
-		rto = std::max<uint>(rtt + rtt_var * 4U, 1000U);
+		rto = std::max<uint>(rtt + rtt_var * 4U, MIN_RTO);
 
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "rtt:%u avg:%u var:%u rto:%u",
@@ -3253,7 +3260,7 @@ void utp_issue_deferred_acks(utp_context *ctx)
 	}
 }
 
-// Should be called every 500ms
+// Should be called every 100ms
 void utp_check_timeouts(utp_context *ctx)
 {
 	assert(ctx);
