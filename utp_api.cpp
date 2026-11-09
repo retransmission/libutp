@@ -90,6 +90,14 @@ struct_utp_context::struct_utp_context()
 	// their receive buffer set much lower, to say 60 kiB or so
 	opt_rcvbuf = opt_sndbuf = 1024 * 1024;
 	last_check = 0;
+	packet_pool.reserve(MAX_POOLED_PACKETS);
+}
+
+struct_utp_context::~struct_utp_context()
+{
+	// Deleting a socket returns its packets to packet_pool, so the sockets go first.
+	utp_sockets.erase_if([](auto const&) { return true; });
+	for (void *pkt : packet_pool) free(pkt);
 }
 
 utp_context* utp_init (int version)
