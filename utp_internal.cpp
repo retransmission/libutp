@@ -614,8 +614,8 @@ struct UTPSocket {
                 return (msec - last_rwin_decay) >= MAX_WINDOW_DECAY;
 	}
 
+	void resend_lost_packets(uint16 reported_end);
 	// If we can, decay max window, returns true if we actually did so
-	void resend_lost_packets();
 	void maybe_decay_win(uint64 current_ms)
 	{
 		if (can_decay_win(current_ms)) {
@@ -1496,22 +1496,30 @@ size_t UTPSocket::selective_ack_bytes(uint base, const byte* mask, byte len, int
 #define MAX_LOST_RESENDS 16
 
 // A packet the peer has not acknowledged, sent well before one it has, is lost (RACK, RFC
-// 8985). This resends a packet whose later resend is lost, and gaps beyond the 32 packets a
-// selective ACK covers, which selective_ack() leaves to a timeout. A quarter of the round trip
-// tolerates reordering. A resent packet counts as sent at its resend, so it is resent again
-// only once a packet sent after that resend is acknowledged.
-void UTPSocket::resend_lost_packets()
+// 8985). This resends a packet whose later resend is lost, and the rest of a gap after the
+// few packets selective_ack() resends, which would otherwise wait for a timeout. A quarter of
+// the round trip tolerates reordering. A resent packet counts as sent at its resend, so it is
+// resent again only once a packet sent after that resend is acknowledged.
+// Only packets before `reported_end` count: the ACK says nothing of later ones, which may
+// have arrived. A selective ACK covers 30 packets, so a longer gap's tail is resent once a
+// later ACK covers it. An ST_STATE without one covers every packet sent (see utp_process_incoming()).
+void UTPSocket::resend_lost_packets(uint16 reported_end)
 {
 	if (cur_window_packets == 0 || latest_acked_send_time == 0)
 		return;
+
+	const uint16 oldest = (seq_nr - cur_window_packets) & ACK_NR_MASK;
+	const uint16 n_reported = (reported_end - oldest) & ACK_NR_MASK;
+	// none when a reordered ACK ends before the oldest packet in flight
+	const int n = n_reported < 0x8000 ? std::min<int>(cur_window_packets, n_reported) : 0;
 
 	const uint64 reorder_window_us = std::max<uint64>(uint64(rtt) * 1000U / 4U, 1000U);
 	if (latest_acked_send_time < reorder_window_us)
 		return;
 	const uint64 lost_before = latest_acked_send_time - reorder_window_us;
 	int resent = 0;
-	for (int i = 0; i < cur_window_packets && resent < MAX_LOST_RESENDS; ++i) {
-		OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(seq_nr - cur_window_packets + i);
+	for (int i = 0; i < n && resent < MAX_LOST_RESENDS; ++i) {
+		OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(oldest + i);
 		if (pkt == NULL || pkt->need_resend)
 			continue; // acked, or already queued for resending
 		if (pkt->transmissions == 0)
@@ -1522,7 +1530,7 @@ void UTPSocket::resend_lost_packets()
 				break;
 			continue;
 		}
-		const uint16 v = (seq_nr - cur_window_packets + i) & ACK_NR_MASK;
+		const uint16 v = (oldest + i) & ACK_NR_MASK;
 		// used in parse_log.py
 		log(UTP_LOG_NORMAL, "Packet %u lost. Resending", v);
 		#ifdef _DEBUG
@@ -2389,7 +2397,13 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	if (selack_ptr != NULL) {
 		conn->selective_ack(pk_ack_nr + 2, selack_ptr, selack_ptr[-1]);
 	}
-	conn->resend_lost_packets();
+	// The ACK reports on the packet after pk_ack_nr, and a selective ACK on up to 30 more:
+	// send_ack() fills only 30 of its 32 bits. The peer adds a selective ACK to an ST_STATE
+	// whenever it holds packets out of order, so an ST_STATE without one reports on every
+	// packet sent: none past pk_ack_nr has arrived. Other packets say nothing past pk_ack_nr + 1.
+	const uint16 reported_end = selack_ptr != NULL ? pk_ack_nr + 2 + std::min(selack_ptr[-1] * 8, 30)
+		: pk_flags == ST_STATE ? conn->seq_nr : pk_ack_nr + 2;
+	conn->resend_lost_packets(reported_end);
 
 	// this invariant should always be true
 	assert(conn->cur_window_packets == 0 || conn->outbuf.get(conn->seq_nr - conn->cur_window_packets));
