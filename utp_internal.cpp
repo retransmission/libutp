@@ -441,6 +441,9 @@ struct UTPSocket {
 
 	// max receive window for other end, in bytes
 	size_t max_window_user;
+	// seq_nr and ack_nr of the packet max_window_user came from
+	uint16 window_seq_nr;
+	uint16 window_ack_nr;
 	CONN_STATE state;
 	// TickCount when we last decayed window (wraps)
 	int64 last_rwin_decay;
@@ -1879,6 +1882,8 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		// to match the sequence number we got from
 		// the other end
 		conn->ack_nr = (pk_seq_nr - 1) & SEQ_NR_MASK;
+		conn->window_seq_nr = conn->ack_nr;
+		conn->window_ack_nr = pk_ack_nr;
 	}
 
 	conn->last_got_packet = conn->ctx->current_ms;
@@ -2149,13 +2154,30 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	// sanity check, the other end should never ack packets
 	// past the point we've sent
 	if (acks <= conn->cur_window_packets) {
-		conn->max_window_user = pf1->windowsize;
+		// Take the window only from a packet no older than the one it last came from, as TCP
+		// does (RFC 9293, SND.WL1 and SND.WL2). A resent packet can carry the window from when
+		// it was first sent: filling that much overflows the peer's receive buffer, and a peer
+		// whose buffer is full of out-of-order data then has no room for the packet that fills
+		// the hole, so neither side moves until the connection times out.
+		//
+		// An ACK-only packet is never resent, so its window is current whatever its seq_nr; only
+		// its ack_nr tells it from an older one the network reordered. Taking it also moves
+		// window_seq_nr back if a bogus data packet far ahead of the stream had pushed it there.
+		const bool newer_ack = !wrapping_compare_less(pk_ack_nr, conn->window_ack_nr, ACK_NR_MASK);
+		const bool current = pk_flags == ST_STATE
+			? newer_ack
+			: !wrapping_compare_less(pk_seq_nr, conn->window_seq_nr, SEQ_NR_MASK)
+				&& (pk_seq_nr != conn->window_seq_nr || newer_ack);
+		if (current) {
+			conn->max_window_user = pf1->windowsize;
+			conn->window_seq_nr = pk_seq_nr;
+			conn->window_ack_nr = pk_ack_nr;
 
-		// If max user window is set to 0, then we startup a timer
-		// That will reset it to 1 after 15 seconds.
-		if (conn->max_window_user == 0)
-			// Reset max_window_user to 1 every 15 seconds.
-			conn->zerowindow_time = conn->ctx->current_ms + 15000;
+			// A zero window starts a timer that reopens it to one packet (PACKET_SIZE)
+			// after 15 seconds, so the sender probes whether it has opened.
+			if (conn->max_window_user == 0)
+				conn->zerowindow_time = conn->ctx->current_ms + 15000;
+		}
 
 		// Respond to connect message
 		// Switch to CONNECTED state.
@@ -2607,6 +2629,8 @@ utp_socket*	utp_create_socket(utp_context *ctx)
 	conn->seq_nr				= 1;
 	conn->ack_nr				= 0;
 	conn->max_window_user		= 255 * PACKET_SIZE;
+	conn->window_seq_nr			= 0;
+	conn->window_ack_nr			= 0;
 	conn->cur_window_packets	= 0;
 	conn->fast_resend_seq_nr	= conn->seq_nr;
 	conn->target_delay			= ctx->target_delay;
@@ -2981,6 +3005,8 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 		conn->ack_nr = seq_nr;
 		conn->seq_nr = utp_call_get_random(ctx, NULL);
 		conn->fast_resend_seq_nr = conn->seq_nr;
+		conn->window_seq_nr = seq_nr;
+		conn->window_ack_nr = (conn->seq_nr - 1) & ACK_NR_MASK;
 		conn->state = CS_SYN_RECV;
 
 		const size_t read = utp_process_incoming(conn, buffer, len, true);
