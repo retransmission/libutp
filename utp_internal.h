@@ -162,7 +162,10 @@ struct struct_utp_context {
 	void *userdata;
 	utp_callback_t* callbacks[UTP_ARRAY_SIZE];
 
+	// The clock on entry to the current API call (or to a nested one made from a callback): one read
+	// serves the packets the call handles. Refreshed by utp_update_clock().
 	uint64 current_ms;
+	uint64 current_us;
 	utp_context_stats context_stats;
 	UTPSocket *last_utp_socket;
 	std::vector<UTPSocket*> ack_sockets;
