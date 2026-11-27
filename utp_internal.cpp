@@ -1482,10 +1482,14 @@ size_t UTPSocket::selective_ack_bytes(uint base, const byte* mask, byte len, int
 		if (bits >= 0 && mask[bits>>3] & (1 << (bits & 7))) {
 			assert((int)(pkt->payload) >= 0);
 			acked_bytes += pkt->payload;
-			if (pkt->time_sent < now)
-				min_rtt = std::min<int64>(min_rtt, now - pkt->time_sent);
-			else
-				min_rtt = std::min<int64>(min_rtt, 50000);
+			// a resent packet's time_sent is its last resend, so the ACK may answer an
+			// earlier copy: only a packet sent once gives a round trip (Karn's rule)
+			if (pkt->transmissions == 1) {
+				if (pkt->time_sent < now)
+					min_rtt = std::min<int64>(min_rtt, now - pkt->time_sent);
+				else
+					min_rtt = std::min<int64>(min_rtt, 50000);
+			}
 			continue;
 		}
 	} while (--bits >= -1);
@@ -2084,11 +2088,16 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 				, conn->mtu_floor, conn->mtu_ceiling, conn->mtu_last);
 		}
 
-		// in case our clock is not monotonic
-		if (pkt->time_sent < now)
-			min_rtt = std::min<int64>(min_rtt, now - pkt->time_sent);
-		else
-			min_rtt = std::min<int64>(min_rtt, 50000);
+		// Only a packet sent once gives a round trip: a resent packet's time_sent is its
+		// last resend, and the ACK may answer an earlier copy (Karn's rule). The delay
+		// estimate is capped at this round trip, so a short one would shift the delay base.
+		if (pkt->transmissions == 1) {
+			// in case our clock is not monotonic
+			if (pkt->time_sent < now)
+				min_rtt = std::min<int64>(min_rtt, now - pkt->time_sent);
+			else
+				min_rtt = std::min<int64>(min_rtt, 50000);
+		}
 	}
 
 	// count bytes acked by EACK
