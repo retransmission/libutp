@@ -155,10 +155,28 @@ void*			utp_context_get_userdata		(utp_context *ctx);
 int				utp_context_set_option			(utp_context *ctx, int opt, int val);
 int				utp_context_get_option			(utp_context *ctx, int opt);
 int				utp_process_udp					(utp_context *ctx, const byte *buf, size_t len, const struct sockaddr *to, socklen_t tolen);
+// Like utp_process_udp(), for a packet that arrived at received_us, such as from a kernel receive
+// timestamp, in the clock of the UTP_GET_MICROSECONDS callback (libutp's default clocks do not
+// expose theirs: see utp_context_set_time()). The one-way delay sample uses the arrival time;
+// everything else, including the timestamps of packets sent meanwhile, uses the current time.
+// received_us 0 means the arrival time is unknown, as with utp_process_udp().
+int				utp_process_udp_received		(utp_context *ctx, const byte *buf, size_t len, const struct sockaddr *to, socklen_t tolen, uint64 received_us);
 int				utp_process_icmp_error			(utp_context *ctx, const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen);
 int				utp_process_icmp_fragmentation	(utp_context *ctx, const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen, uint16 next_hop_mtu);
 void			utp_check_timeouts				(utp_context *ctx);
 void			utp_issue_deferred_acks			(utp_context *ctx);
+// Until utp_context_clear_time(), libutp takes now_us as the current time instead of calling the
+// clock callbacks: for a caller that handles many packets at once, one clock read per batch instead
+// of several per packet. now_us is in the clock of the UTP_GET_MICROSECONDS callback. libutp's
+// default clocks do not expose theirs, so a caller that passes its own times installs its own
+// UTP_GET_MICROSECONDS and UTP_GET_MILLISECONDS. The held millisecond time is now_us / 1000 with
+// libutp's default clocks outside Windows, and one read of UTP_GET_MILLISECONDS otherwise, since
+// the two clocks may count from different points.
+void			utp_context_set_time			(utp_context *ctx, uint64 now_us);
+// Reads the clock and holds that time like utp_context_set_time(); works with any clocks. Returns 1,
+// or 0 and does nothing if a time is already set, so that only the caller that set it clears it.
+int				utp_context_hold_time			(utp_context *ctx);
+void			utp_context_clear_time			(utp_context *ctx);
 utp_context_stats* utp_get_context_stats		(utp_context *ctx);
 utp_socket*		utp_create_socket				(utp_context *ctx);
 void*			utp_set_userdata				(utp_socket *s, void *userdata);

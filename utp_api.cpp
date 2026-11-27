@@ -65,6 +65,13 @@ const char *utp_state_names[] = {
 struct_utp_context::struct_utp_context()
 	: userdata(NULL)
 	, current_ms(0)
+	, current_us(0)
+	, time_held(false)
+	, fixed_time_ms(0)
+	, last_time_ms(0)
+	, fixed_time_us(0)
+	, last_time_us(0)
+	, received_time_us(0)
 	, last_utp_socket(NULL)
 	, log_normal(false)
 	, log_mtu(false)
@@ -120,6 +127,46 @@ void* utp_context_set_userdata(utp_context *ctx, void *userdata) {
 void* utp_context_get_userdata(utp_context *ctx) {
 	assert(ctx);
 	return ctx ? ctx->userdata : NULL;
+}
+
+// The millisecond time that goes with now_us. libutp's default millisecond clock is its
+// microsecond clock / 1000, except on Windows, where it is GetTickCount(). Other clocks may count
+// from different points, so read the millisecond clock itself.
+static uint64 utp_held_ms(utp_context *ctx, uint64 now_us)
+{
+#ifdef WIN32
+	(void)now_us;
+#else
+	if (ctx->callbacks[UTP_GET_MILLISECONDS] == &utp_default_get_milliseconds
+		&& ctx->callbacks[UTP_GET_MICROSECONDS] == &utp_default_get_microseconds)
+		return now_us / 1000;
+#endif
+	return utp_call_get_milliseconds(ctx, NULL);
+}
+
+void utp_context_set_time(utp_context *ctx, uint64 now_us) {
+	assert(ctx);
+	if (!ctx) return;
+	ctx->time_held = false;
+	const uint64 now_ms = utp_held_ms(ctx, now_us);
+	// Never earlier than a time already handed out: libutp assumes its clock never goes back.
+	ctx->fixed_time_us = now_us > ctx->last_time_us ? now_us : ctx->last_time_us;
+	ctx->fixed_time_ms = now_ms > ctx->last_time_ms ? now_ms : ctx->last_time_ms;
+	ctx->last_time_us = ctx->fixed_time_us;
+	ctx->last_time_ms = ctx->fixed_time_ms;
+	ctx->time_held = true;
+}
+
+int utp_context_hold_time(utp_context *ctx) {
+	assert(ctx);
+	if (!ctx || ctx->time_held) return 0;
+	utp_context_set_time(ctx, utp_call_get_microseconds(ctx, NULL));
+	return 1;
+}
+
+void utp_context_clear_time(utp_context *ctx) {
+	assert(ctx);
+	if (ctx) ctx->time_held = false;
 }
 
 utp_context_stats* utp_get_context_stats(utp_context *ctx) {

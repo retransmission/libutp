@@ -140,24 +140,39 @@ uint16 utp_call_get_udp_overhead(utp_context *ctx, utp_socket *socket, const str
 	return (uint16)ctx->callbacks[UTP_GET_UDP_OVERHEAD](&args);
 }
 
+// A time set by utp_context_set_time() may be a little ahead of the clock. Until the clock catches
+// up, a read returns that time, so libutp's clock does not go back. A clock that jumps back further
+// than this, such as a wrapping tick count, is passed through as it always was.
+#define UTP_SET_TIME_MAX_LEAD_MS 1000
+
 uint64 utp_call_get_milliseconds(utp_context *ctx, utp_socket *socket)
 {
+	if (ctx->time_held) return ctx->fixed_time_ms;
 	utp_callback_arguments args;
 	if (!ctx->callbacks[UTP_GET_MILLISECONDS]) return 0;
 	args.callback_type = UTP_GET_MILLISECONDS;
 	args.context = ctx;
 	args.socket = socket;
-	return ctx->callbacks[UTP_GET_MILLISECONDS](&args);
+	const uint64 now_ms = ctx->callbacks[UTP_GET_MILLISECONDS](&args);
+	if (now_ms < ctx->last_time_ms && ctx->last_time_ms - now_ms < UTP_SET_TIME_MAX_LEAD_MS)
+		return ctx->last_time_ms;
+	ctx->last_time_ms = now_ms;
+	return now_ms;
 }
 
 uint64 utp_call_get_microseconds(utp_context *ctx, utp_socket *socket)
 {
+	if (ctx->time_held) return ctx->fixed_time_us;
 	utp_callback_arguments args;
 	if (!ctx->callbacks[UTP_GET_MICROSECONDS]) return 0;
 	args.callback_type = UTP_GET_MICROSECONDS;
 	args.context = ctx;
 	args.socket = socket;
-	return ctx->callbacks[UTP_GET_MICROSECONDS](&args);
+	const uint64 now_us = ctx->callbacks[UTP_GET_MICROSECONDS](&args);
+	if (now_us < ctx->last_time_us && ctx->last_time_us - now_us < UTP_SET_TIME_MAX_LEAD_MS * 1000)
+		return ctx->last_time_us;
+	ctx->last_time_us = now_us;
+	return now_us;
 }
 
 uint32 utp_call_get_random(utp_context *ctx, utp_socket *socket)
