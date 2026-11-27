@@ -1814,7 +1814,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	#endif
 
 	// mark receipt time
-	uint64 time = conn->ctx->current_us;
+	uint64 time = conn->ctx->received_time_us ? conn->ctx->received_time_us : conn->ctx->current_us;
 
 	// window packets size is used to calculate a minimum
 	// permissible range for received acks. connections with acks falling
@@ -2843,8 +2843,29 @@ UTPSocket* LookupAdjacent(utp_context *ctx, PackedSockAddr const& addr, uint32 c
 }
 
 
+static int process_udp(utp_context *ctx, const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen);
+
+// The arrival time belongs to this packet only: a utp_process_udp() call made from a callback
+// meanwhile, as an in-memory link does, gets its own, and this one gets it back afterwards.
+int utp_process_udp_received(utp_context *ctx, const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen, uint64 received_us)
+{
+	assert(ctx);
+	if (!ctx) return 0;
+
+	const uint64 outer = ctx->received_time_us;
+	ctx->received_time_us = received_us;
+	const int ret = process_udp(ctx, buffer, len, to, tolen);
+	ctx->received_time_us = outer;
+	return ret;
+}
+
 // Returns 1 if the UDP payload was recognized as a UTP packet, or 0 if it was not
 int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen)
+{
+	return utp_process_udp_received(ctx, buffer, len, to, tolen, 0);
+}
+
+static int process_udp(utp_context *ctx, const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen)
 {
 	assert(ctx);
 	if (!ctx) return 0;

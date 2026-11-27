@@ -176,6 +176,8 @@ struct struct_utp_context {
 	uint64 fixed_time_us;
 	// The latest time handed out, in microseconds. No clock read returns less.
 	uint64 last_time_us;
+	// While non-zero, when the packet being processed arrived, in microseconds; see utp_process_udp_received().
+	uint64 received_time_us;
 	utp_context_stats context_stats;
 	UTPSocket *last_utp_socket;
 	std::vector<UTPSocket*> ack_sockets;
