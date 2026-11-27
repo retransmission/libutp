@@ -404,9 +404,13 @@ struct UTPSocket {
 	~UTPSocket();
 
 	PackedSockAddr addr;
+	// addr as the sockaddr handed to the sendto, MTU and overhead callbacks, converted once when
+	// addr is set rather than for every packet.
+	SOCKADDR_STORAGE peer_sockaddr;
 	utp_context *ctx;
 
 	int ida; //for ack socket list
+	socklen_t peer_sockaddr_len; // beside ida rather than peer_sockaddr: fills padding before the next field
 
 	uint16 retransmit_count;
 
@@ -621,16 +625,12 @@ struct UTPSocket {
 
 	size_t get_udp_mtu()
 	{
-		socklen_t len;
-		SOCKADDR_STORAGE sa = addr.get_sockaddr_storage(&len);
-		return utp_call_get_udp_mtu(this->ctx, this, (const struct sockaddr *)&sa, len);
+		return utp_call_get_udp_mtu(this->ctx, this, (const struct sockaddr *)&peer_sockaddr, peer_sockaddr_len);
 	}
 
 	size_t get_udp_overhead()
 	{
-		socklen_t len;
-		SOCKADDR_STORAGE sa = addr.get_sockaddr_storage(&len);
-		return utp_call_get_udp_overhead(this->ctx, this, (const struct sockaddr *)&sa, len);
+		return utp_call_get_udp_overhead(this->ctx, this, (const struct sockaddr *)&peer_sockaddr, peer_sockaddr_len);
 	}
 
 	size_t get_overhead()
@@ -701,12 +701,17 @@ static void utp_register_sent_packet(utp_context *ctx, size_t length)
 	}
 }
 
+static void send_to_sockaddr(utp_context *ctx, const byte *p, size_t len, const SOCKADDR_STORAGE &to, socklen_t tolen, int flags)
+{
+	utp_register_sent_packet(ctx, len);
+	utp_call_sendto(ctx, NULL, p, len, (const struct sockaddr *)&to, tolen, flags);
+}
+
 void send_to_addr(utp_context *ctx, const byte *p, size_t len, const PackedSockAddr &addr, int flags = 0)
 {
 	socklen_t tolen;
 	SOCKADDR_STORAGE to = addr.get_sockaddr_storage(&tolen);
-	utp_register_sent_packet(ctx, len);
-	utp_call_sendto(ctx, NULL, p, len, (const struct sockaddr *)&to, tolen, flags);
+	send_to_sockaddr(ctx, p, len, to, tolen, flags);
 }
 
 void UTPSocket::schedule_ack()
@@ -762,7 +767,7 @@ void UTPSocket::send_data(byte* b, size_t length, bandwidth_type_t type, uint32 
 		addrfmt(addr, addrbuf), (uint)length, conn_id_send, time, reply_micro, flagnames[flags2],
 		seq_nr, ack_nr);
 #endif
-	send_to_addr(ctx, b, length, addr, flags);
+	send_to_sockaddr(ctx, b, length, peer_sockaddr, peer_sockaddr_len, flags);
 	removeSocketFromAckList(this);
 }
 
@@ -2546,6 +2551,7 @@ void utp_initialize_socket(	utp_socket *conn,
 	conn->conn_seed				= conn_seed;
 	conn->conn_id_recv			= conn_id_recv;
 	conn->conn_id_send			= conn_id_send;
+	conn->peer_sockaddr			= psaddr.get_sockaddr_storage(&conn->peer_sockaddr_len);
 	conn->addr					= psaddr;
 	conn->ctx->current_ms		= utp_call_get_milliseconds(conn->ctx, NULL);
 	conn->last_got_packet		= conn->ctx->current_ms;
@@ -3300,10 +3306,8 @@ int utp_getpeername(utp_socket *conn, struct sockaddr *addr, socklen_t *addrlen)
 	assert(conn->state != CS_UNINITIALIZED);
 	if (conn->state == CS_UNINITIALIZED) return -1;
 
-	socklen_t len;
-	const SOCKADDR_STORAGE sa = conn->addr.get_sockaddr_storage(&len);
-	*addrlen = std::min(len, *addrlen);
-	memcpy(addr, &sa, *addrlen);
+	*addrlen = std::min(conn->peer_sockaddr_len, *addrlen);
+	memcpy(addr, &conn->peer_sockaddr, *addrlen);
 	return 0;
 }
 
