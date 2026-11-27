@@ -2317,6 +2317,10 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		acks, (uint)acked_bytes, conn->seq_nr, (uint)conn->cur_window, conn->cur_window_packets);
 	#endif
 
+	// Send the packets queued while the window was full: the ACK made room, and otherwise
+	// they wait for the next write or the next timeout check.
+	if (conn->state != CS_DESTROY) conn->flush_packets();
+
 	// In case the ack dropped the current window below
 	// the max_window size, Mark the socket as writable
 	if (conn->state == CS_CONNECTED_FULL && !conn->is_full()) {
