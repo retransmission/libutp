@@ -51,6 +51,15 @@
 #define DELAY_BASE_HISTORY 13
 #define MAX_WINDOW_DECAY 100 // ms
 
+// The most bytes a connection keeps in flight when its lowest round trip time
+// is under 1 ms. They can then all wait in the peer's UDP receive buffer
+// until it reads them, and what does not fit is dropped. 64 KiB is about 50
+// full packets, and Linux's default 208 KiB buffer holds about 90.
+#define SHORT_PATH_WINDOW (64 * 1024)
+// How much more for each millisecond of round trip time: what is in transit
+// instead of in that buffer, for a peer that reads 32 MiB/s as data arrives.
+#define WINDOW_PER_RTT_MS (32 * 1024)
+
 #define REORDER_BUFFER_SIZE 32
 #define REORDER_BUFFER_MAX_SIZE 1024
 #define OUTGOING_BUFFER_MAX_SIZE 1024
@@ -650,6 +659,7 @@ struct UTPSocket {
 
 	void send_packet(OutgoingPacket *pkt);
 
+	size_t max_send_window() const;
 	bool is_full(int bytes = -1);
 	bool flush_packets();
 	void write_outgoing_packet(size_t payload, uint flags, struct utp_iovec *iovec, size_t num_iovecs);
@@ -926,12 +936,20 @@ void UTPSocket::send_packet(OutgoingPacket *pkt)
 		: retransmit_overhead, use_as_mtu_probe ? UTP_UDP_DONTFRAG : 0);
 }
 
+// The most bytes in flight: opt_sndbuf, or less on a path too short to hold that much.
+size_t UTPSocket::max_send_window() const
+{
+	// the lowest round trip time in rtt_hist's memory, 0 until it has one
+	const size_t rtt_ms = rtt_hist.delay_base;
+	return std::min(opt_sndbuf, SHORT_PATH_WINDOW + rtt_ms * WINDOW_PER_RTT_MS);
+}
+
 bool UTPSocket::is_full(int bytes)
 {
 	size_t packet_size = get_packet_size();
 	if (bytes < 0) bytes = packet_size;
 	else if (bytes > (int)packet_size) bytes = (int)packet_size;
-	size_t max_send = std::min({ max_window, opt_sndbuf, max_window_user });
+	size_t max_send = std::min({ max_window, max_send_window(), max_window_user });
 
 	// subtract one to save space for the FIN packet
 	if (cur_window_packets >= OUTGOING_BUFFER_MAX_SIZE - 1) {
@@ -1714,7 +1732,7 @@ void UTPSocket::apply_ccontrol(size_t bytes_acked, uint32 actual_delay, int64 mi
 
 	// make sure that the congestion window is below max
 	// make sure that we don't shrink our window too small
-	max_window = clamp<size_t>(max_window, MIN_WINDOW_SIZE, opt_sndbuf);
+	max_window = clamp<size_t>(max_window, MIN_WINDOW_SIZE, max_send_window());
 
 	// used in parse_log.py
 	log(UTP_LOG_NORMAL, "actual_delay:%u our_delay:%d their_delay:%u off_target:%d max_window:%u "
