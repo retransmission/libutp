@@ -158,6 +158,9 @@ private:
 	Map map_;
 };
 
+// Pooled packet buffers kept per context while no packet uses them: about 1.5 MB.
+#define MAX_POOLED_PACKETS 1024
+
 struct struct_utp_context {
 	void *userdata;
 	utp_callback_t* callbacks[UTP_ARRAY_SIZE];
@@ -172,8 +175,11 @@ struct struct_utp_context {
 	size_t opt_sndbuf;
 	size_t opt_rcvbuf;
 	uint64 last_check;
+	// Freed outgoing packet buffers of the pooled size, reused before allocating new ones.
+	std::vector<void*> packet_pool;
 
 	struct_utp_context();
+	~struct_utp_context();
 
 	void log(int level, utp_socket *socket, char const *fmt, ...);
 	void log_unchecked(utp_socket *socket, char const *fmt, ...);

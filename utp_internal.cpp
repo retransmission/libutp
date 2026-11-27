@@ -28,6 +28,23 @@
 #include <limits.h> // for UINT_MAX
 #include <time.h>
 
+// Pooled packet buffers are never freed, so AddressSanitizer would not see a use after
+// free_packet(). Under ASan they are poisoned while in the pool.
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define UTP_ASAN 1
+#endif
+#endif
+#if defined(__SANITIZE_ADDRESS__)
+#define UTP_ASAN 1
+#endif
+#ifdef UTP_ASAN
+#include <sanitizer/asan_interface.h>
+#else
+#define ASAN_POISON_MEMORY_REGION(addr, size) ((void)(addr), (void)(size))
+#define ASAN_UNPOISON_MEMORY_REGION(addr, size) ((void)(addr), (void)(size))
+#endif
+
 #include <algorithm>
 #include <limits>
 
@@ -188,8 +205,47 @@ struct OutgoingPacket {
 	uint64 time_sent; // microseconds
 	uint transmissions:31;
 	bool need_resend:1;
+	// Bytes that data can hold.
+	size_t capacity;
 	byte data[1];
 };
+
+// A pooled packet holds a header and payload up to the largest UDP payload of a 1500-byte
+// Ethernet MTU, so every packet at libutp's default MTU fits. Bigger ones are allocated to size.
+static const size_t POOLED_PACKET_DATA = 1500 - 20 - 8;
+static const size_t POOLED_PACKET_SIZE = (sizeof(OutgoingPacket) - 1) + POOLED_PACKET_DATA;
+
+// Returns a packet whose data holds at least data_size bytes; its other fields are unset.
+static OutgoingPacket *alloc_packet(utp_context *ctx, size_t data_size)
+{
+	OutgoingPacket *pkt;
+	if (data_size <= POOLED_PACKET_DATA) {
+		if (!ctx->packet_pool.empty()) {
+			pkt = (OutgoingPacket*)ctx->packet_pool.back();
+			ctx->packet_pool.pop_back();
+			ASAN_UNPOISON_MEMORY_REGION(pkt, POOLED_PACKET_SIZE);
+		} else {
+			pkt = (OutgoingPacket*)malloc(POOLED_PACKET_SIZE);
+		}
+		pkt->capacity = POOLED_PACKET_DATA;
+	} else {
+		pkt = (OutgoingPacket*)malloc((sizeof(OutgoingPacket) - 1) + data_size);
+		pkt->capacity = data_size;
+	}
+	return pkt;
+}
+
+static void free_packet(utp_context *ctx, OutgoingPacket *pkt)
+{
+	if (pkt == NULL) return;
+	if (pkt->capacity == POOLED_PACKET_DATA && ctx->packet_pool.size() < MAX_POOLED_PACKETS) {
+		// packet_pool has room reserved for MAX_POOLED_PACKETS, so this does not allocate.
+		ctx->packet_pool.push_back(pkt);
+		ASAN_POISON_MEMORY_REGION(pkt, POOLED_PACKET_SIZE);
+	} else {
+		free(pkt);
+	}
+}
 
 struct SizableCircularBuffer {
 	// This is the mask. Since it's always a power of 2, adding 1 to this value will return the size.
@@ -1017,19 +1073,25 @@ void UTPSocket::write_outgoing_packet(size_t payload, uint flags, struct utp_iov
 		if (payload && pkt && !pkt->transmissions && pkt->payload < packet_size) {
 			// Use the previous unsent packet
 			added = std::min(payload + pkt->payload, std::max(packet_size, pkt->payload)) - pkt->payload;
-			pkt = (OutgoingPacket*)realloc(pkt,
-										   (sizeof(OutgoingPacket) - 1) +
-										   header_size +
-										   pkt->payload + added);
-			outbuf.put(seq_nr - 1, pkt);
+			const size_t needed = header_size + pkt->payload + added;
+			if (needed > pkt->capacity) {
+				// The packet outgrows its buffer: the MTU is above POOLED_PACKET_DATA (from a
+				// caller's MTU callback) and a pooled first packet is appended to, or the MTU
+				// has grown since the packet was allocated.
+				OutgoingPacket *bigger = alloc_packet(ctx, needed);
+				const size_t capacity = bigger->capacity;
+				memcpy(bigger, pkt, (sizeof(OutgoingPacket) - 1) + header_size + pkt->payload);
+				bigger->capacity = capacity;
+				free_packet(ctx, pkt);
+				pkt = bigger;
+				outbuf.put(seq_nr - 1, pkt);
+			}
 			append = false;
 			assert(!pkt->need_resend);
 		} else {
 			// Create the packet to send.
 			added = payload;
-			pkt = (OutgoingPacket*)malloc((sizeof(OutgoingPacket) - 1) +
-										  header_size +
-										  added);
+			pkt = alloc_packet(ctx, header_size + added);
 			pkt->payload = 0;
 			pkt->transmissions = 0;
 			pkt->need_resend = false;
@@ -1401,7 +1463,7 @@ int UTPSocket::ack_packet(uint16 seq)
 		assert(cur_window >= pkt->payload);
 		cur_window -= pkt->payload;
 	}
-	free(pkt);
+	free_packet(ctx, pkt);
 	retransmit_count = 0;
 	return 0;
 }
@@ -2510,7 +2572,7 @@ UTPSocket::~UTPSocket()
 		free(inbuf.elements[i]);
 	}
 	for (size_t i = 0; i <= outbuf.mask; i++) {
-		free(outbuf.elements[i]);
+		free_packet(ctx, (OutgoingPacket*)outbuf.elements[i]);
 	}
 	// TODO: The circular buffer should have a destructor
 	free(inbuf.elements);
@@ -2766,7 +2828,7 @@ int utp_connect(utp_socket *conn, const struct sockaddr *to, socklen_t tolen)
 	// Create the connect packet.
 	const size_t header_size = sizeof(PacketFormatV1);
 
-	OutgoingPacket *pkt = (OutgoingPacket*)malloc(sizeof(OutgoingPacket) - 1 + header_size);
+	OutgoingPacket *pkt = alloc_packet(conn->ctx, header_size);
 	PacketFormatV1* p1 = (PacketFormatV1*)pkt->data;
 
 	memset(p1, 0, header_size);
