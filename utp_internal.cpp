@@ -1658,32 +1658,50 @@ void UTPSocket::apply_ccontrol(size_t bytes_acked, uint32 actual_delay, int64 mi
 
 	double off_target = target - our_delay;
 
-	// this is the same as:
-	//
-	//    (std::min(off_target, target) / target) * (bytes_acked / max_window) * MAX_CWND_INCREASE_BYTES_PER_RTT
-	//
-	// so, it's scaling the max increase by the fraction of the window this ack represents, and the fraction
-	// of the target delay the current delay represents.
-	// The std::min() around off_target protects against crazy values of our_delay, which may happen when th
-	// timestamps wraps, or by just having a malicious peer sending garbage. This caps the increase
-	// of the window size to MAX_CWND_INCREASE_BYTES_PER_RTT per rtt.
-	// as for large negative numbers, this direction is already capped at the min packet size further down
 	// the min around the bytes_acked protects against the case where the window size was recently
 	// shrunk and the number of acked bytes exceeds that. This is considered no more than one full
 	// window, in order to keep the gain within sane boundries.
-
 	assert(bytes_acked > 0);
 	double window_factor = std::min<double>(bytes_acked, max_window) / std::max<double>(max_window, bytes_acked);
 
-	double delay_factor = off_target / target;
-	double scaled_gain = MAX_CWND_INCREASE_BYTES_PER_RTT * window_factor * delay_factor;
+	double scaled_gain;
+	if (off_target >= 0) {
+		// Below the target, grow by at most MAX_CWND_INCREASE_BYTES_PER_RTT per round trip:
+		//
+		//    (off_target / target) * (bytes_acked / max_window) * MAX_CWND_INCREASE_BYTES_PER_RTT
+		//
+		// scaling the increase by the fraction of the window this ack represents, and by how far
+		// below the target the delay is. off_target is at most target, so a garbage delay (a
+		// wrapped timestamp, a malicious peer) cannot grow the window faster.
+		double delay_factor = off_target / target;
+		scaled_gain = MAX_CWND_INCREASE_BYTES_PER_RTT * window_factor * delay_factor;
 
-	// since MAX_CWND_INCREASE_BYTES_PER_RTT is a cap on how much the window size (max_window)
-	// may increase per RTT, we may not increase the window size more than that proportional
-	// to the number of bytes that were acked, so that once one window has been acked (one rtt)
-	// the increase limit is not exceeded
-	// the +1. is to allow for floating point imprecision
-	assert(scaled_gain <= 1. + MAX_CWND_INCREASE_BYTES_PER_RTT * std::min<double>(bytes_acked, max_window) / std::max<double>(max_window, bytes_acked));
+		// the +1. is to allow for floating point imprecision
+		assert(scaled_gain <= 1. + MAX_CWND_INCREASE_BYTES_PER_RTT * window_factor);
+	} else {
+		// Above the target, shrink in proportion to the window and to how far the delay
+		// overshoots, by at most half the window per round trip, as LEDBAT++ does
+		// (draft-irtf-iccrg-ledbat-plus-plus). A fixed gain would shrink a large window by a
+		// few kilobytes per round trip, so the queue it built when the bottleneck slowed down
+		// would take tens of seconds to drain. The clock drift penalty above counts as
+		// overshoot too: a peer that slows its clock to look less loaded gets the window a
+		// truly loaded path would.
+		const double overshoot = -off_target / target;
+		const double per_rtt = std::min<double>(max_window * overshoot, max_window / 2.0);
+
+		// Spread the round trip's decrease over the bytes in flight, so the acks of one round
+		// trip take off per_rtt in all, even after a loss has halved max_window below what is
+		// still in flight. cur_window still counts this ack's bytes.
+		const double flight = std::max<double>(max_window, cur_window);
+		scaled_gain = -per_rtt * std::min<double>(bytes_acked, flight) / flight;
+
+		// Delay alone never takes the window below two packets (RFC 6817's min_cwnd): below
+		// one packet nothing could be sent until the retransmission timeout. Loss and timeouts
+		// still shrink it further.
+		const double floor = 2.0 * get_packet_size();
+		if (max_window + scaled_gain < floor)
+			scaled_gain = std::min(0.0, floor - max_window);
+	}
 
 	if (scaled_gain > 0 && ctx->current_ms - last_maxed_out_window > 1000) {
 		// if it was more than 1 second since we tried to send a packet
