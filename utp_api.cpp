@@ -65,6 +65,7 @@ const char *utp_state_names[] = {
 struct_utp_context::struct_utp_context()
 	: userdata(NULL)
 	, current_ms(0)
+	, current_us(0)
 	, last_utp_socket(NULL)
 	, log_normal(false)
 	, log_mtu(false)

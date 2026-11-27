@@ -34,6 +34,7 @@
 #include "utp_types.h"
 #include "utp_packedsockaddr.h"
 #include "utp_internal.h"
+#include "utp_utils.h" // utp_default_get_milliseconds, utp_default_get_microseconds
 
 #define	TIMEOUT_CHECK_INTERVAL	500
 
@@ -80,6 +81,26 @@
 #define TIMESTAMP_MASK 0xFFFFFFFF
 
 #define DIV_ROUND_UP(num, denom) ((num + denom - 1) / denom)
+
+// Read the clock on entry to an API call. Packets sent, timestamped or acked in the call use
+// ctx->current_ms and ctx->current_us. An API call made from a callback reads it again, so the
+// values only move forward within a call. Clock callbacks get a NULL socket when no single
+// socket is being handled (deferred ACKs, timeout checks, unknown senders).
+static void utp_update_clock(utp_context *ctx, utp_socket *socket)
+{
+#ifndef WIN32
+	// The default millisecond clock is the default microsecond clock / 1000 (on Windows it is
+	// GetTickCount()), so one read gives both.
+	if (ctx->callbacks[UTP_GET_MILLISECONDS] == &utp_default_get_milliseconds
+		&& ctx->callbacks[UTP_GET_MICROSECONDS] == &utp_default_get_microseconds) {
+		ctx->current_us = utp_call_get_microseconds(ctx, socket);
+		ctx->current_ms = ctx->current_us / 1000;
+		return;
+	}
+#endif
+	ctx->current_ms = utp_call_get_milliseconds(ctx, socket);
+	ctx->current_us = utp_call_get_microseconds(ctx, socket);
+}
 
 // The totals are derived from the following data:
 //  45: IPv6 address including embedded IPv4 address
@@ -729,7 +750,7 @@ void UTPSocket::send_data(byte* b, size_t length, bandwidth_type_t type, uint32 
 	// time stamp this packet with local time, the stamp goes into
 	// the header of every packet at the 8th byte for 8 bytes :
 	// two integers, check packet.h for more
-	uint64 time = utp_call_get_microseconds(ctx, this);
+	uint64 time = ctx->current_us;
 
 	PacketFormatV1* b1 = (PacketFormatV1*)b;
 	b1->tv_usec = (uint32)time;
@@ -870,7 +891,7 @@ void UTPSocket::send_packet(OutgoingPacket *pkt)
 	// at slow rates (max window < packet size)
 
 	//size_t max_send = std::min(max_window, opt_sndbuf, max_window_user);
-	time_t cur_time = utp_call_get_milliseconds(this->ctx, this);
+	time_t cur_time = ctx->current_ms;
 
 	if (pkt->transmissions == 0 || pkt->need_resend) {
 		cur_window += pkt->payload;
@@ -880,7 +901,7 @@ void UTPSocket::send_packet(OutgoingPacket *pkt)
 
 	PacketFormatV1* p1 = (PacketFormatV1*)pkt->data;
 	p1->ack_nr = ack_nr;
-	pkt->time_sent = utp_call_get_microseconds(this->ctx, this);
+	pkt->time_sent = ctx->current_us;
 
 	//socklen_t salen;
 	//SOCKADDR_STORAGE sa = addr.get_sockaddr_storage(&salen);
@@ -1314,7 +1335,7 @@ void UTPSocket::mtu_search_update()
 		mtu_ceiling = mtu_floor;
 		assert(mtu_floor <= mtu_ceiling);
 		// Do another search in 30 minutes
-		mtu_discover_time = utp_call_get_milliseconds(this->ctx, this) + 30 * 60 * 1000;
+		mtu_discover_time = ctx->current_ms + 30 * 60 * 1000;
 	}
 }
 
@@ -1326,7 +1347,7 @@ void UTPSocket::mtu_reset()
 	log(UTP_LOG_MTU, "MTU [RESET] floor:%d ceiling:%d current:%d"
 		, mtu_floor, mtu_ceiling, mtu_last);
 	assert(mtu_floor <= mtu_ceiling);
-	mtu_discover_time = utp_call_get_milliseconds(this->ctx, this) + 30 * 60 * 1000;
+	mtu_discover_time = ctx->current_ms + 30 * 60 * 1000;
 }
 
 // returns:
@@ -1368,7 +1389,7 @@ int UTPSocket::ack_packet(uint16 seq)
 	// if we never re-sent the packet, update the RTT estimate
 	if (pkt->transmissions == 1) {
 		// Estimate the round trip time.
-		const uint32 ertt = (uint32)((utp_call_get_microseconds(this->ctx, this) - pkt->time_sent) / 1000);
+		const uint32 ertt = (uint32)((ctx->current_us - pkt->time_sent) / 1000);
 		if (rtt == 0) {
 			// First round trip time sample
 			rtt = ertt;
@@ -1413,7 +1434,7 @@ size_t UTPSocket::selective_ack_bytes(uint base, const byte* mask, byte len, int
 
 	size_t acked_bytes = 0;
 	int bits = len * 8;
-	uint64 now = utp_call_get_microseconds(this->ctx, this);
+	uint64 now = ctx->current_us;
 
 	do {
 		uint v = base + bits;
@@ -1730,7 +1751,7 @@ void UTPSocket::apply_ccontrol(size_t bytes_acked, uint32 actual_delay, int64 mi
 			(uint)(cur_window - bytes_acked), (float)(scaled_gain), rtt,
 			(uint)(max_window * 1000 / (rtt_hist.delay_base?rtt_hist.delay_base:50)),
 			(uint)max_window_user, rto, (int)(rto_timeout - ctx->current_ms),
-			utp_call_get_microseconds(this->ctx, this), cur_window_packets, (uint)get_packet_size(),
+			ctx->current_us, cur_window_packets, (uint)get_packet_size(),
 			their_hist.delay_base, their_hist.delay_base + their_hist.get_value(),
 			average_delay, clock_drift, clock_drift_raw, penalty / 1000,
 			current_delay_sum, current_delay_samples, average_delay_base,
@@ -1775,7 +1796,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 {
 	utp_register_recv_packet(conn, len);
 
-	conn->ctx->current_ms = utp_call_get_milliseconds(conn->ctx, conn);
+	utp_update_clock(conn->ctx, conn);
 
 	const PacketFormatV1 *pf1 = (PacketFormatV1*)packet;
 	const byte *packet_end = packet + len;
@@ -1793,7 +1814,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	#endif
 
 	// mark receipt time
-	uint64 time = utp_call_get_microseconds(conn->ctx, conn);
+	uint64 time = conn->ctx->current_us;
 
 	// window packets size is used to calculate a minimum
 	// permissible range for received acks. connections with acks falling
@@ -1965,7 +1986,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	// this is done in apply_ledbat_ccontrol()
 	int64 min_rtt = std::numeric_limits<int64_t>::max();
 
-	uint64 now = utp_call_get_microseconds(conn->ctx, conn);
+	uint64 now = conn->ctx->current_us;
 
 	for (int i = 0; i < acks; ++i) {
 		uint32 seq = (conn->seq_nr - conn->cur_window_packets + i) & ACK_NR_MASK;
@@ -2547,7 +2568,7 @@ void utp_initialize_socket(	utp_socket *conn,
 	conn->conn_id_recv			= conn_id_recv;
 	conn->conn_id_send			= conn_id_send;
 	conn->addr					= psaddr;
-	conn->ctx->current_ms		= utp_call_get_milliseconds(conn->ctx, NULL);
+	utp_update_clock(conn->ctx, NULL);
 	conn->last_got_packet		= conn->ctx->current_ms;
 	conn->last_sent_packet		= conn->ctx->current_ms;
 	conn->last_measured_delay	= conn->ctx->current_ms + 0x70000000;
@@ -2743,7 +2764,6 @@ int utp_connect(utp_socket *conn, const struct sockaddr *to, socklen_t tolen)
 	assert(sizeof(PacketFormatV1) == 20);
 
 	conn->state = CS_SYN_SENT;
-	conn->ctx->current_ms = utp_call_get_milliseconds(conn->ctx, conn);
 
 	// Create and send a connect message
 
@@ -2909,7 +2929,7 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 	// We have not found a matching utp_socket, and this isn't a SYN.  Reject it.
 	const uint32 seq_nr = pf1->seq_nr;
 	if (flags != ST_SYN) {
-		ctx->current_ms = utp_call_get_milliseconds(ctx, NULL);
+		utp_update_clock(ctx, NULL);
 
 		for (auto& info : ctx->rst_info) {
 			if ((info.connid == id) && (info.addr == addr) && (info.ack_nr == seq_nr)) {
@@ -3067,6 +3087,7 @@ int utp_process_icmp_fragmentation(utp_context *ctx, const byte* buffer, size_t 
 {
 	UTPSocket* conn = parse_icmp_payload(ctx, buffer, len, to, tolen);
 	if (!conn) return 0;
+	utp_update_clock(ctx, conn);
 
 	// Constrain the next_hop_mtu to sane values.  It might not be initialized or sent properly
 	if (next_hop_mtu >= 576 && next_hop_mtu < 0x2000) {
@@ -3172,7 +3193,7 @@ ssize_t utp_writev(utp_socket *conn, struct utp_iovec *iovec_input, size_t num_i
 		return 0;
 	}
 
-	conn->ctx->current_ms = utp_call_get_milliseconds(conn->ctx, conn);
+	utp_update_clock(conn->ctx, conn);
 
 	// don't send unless it will all fit in the window
 	size_t packet_size = conn->get_packet_size();
@@ -3230,11 +3251,11 @@ void utp_read_drained(utp_socket *conn)
 	const size_t rcvwin = conn->get_rcv_window();
 
 	if (rcvwin > conn->last_rcv_win) {
+		utp_update_clock(conn->ctx, conn);
 		// If last window was 0 send ACK immediately, otherwise should set timer
 		if (conn->last_rcv_win == 0) {
 			conn->send_ack();
 		} else {
-			conn->ctx->current_ms = utp_call_get_milliseconds(conn->ctx, conn);
 			conn->schedule_ack();
 		}
 	}
@@ -3246,6 +3267,7 @@ void utp_issue_deferred_acks(utp_context *ctx)
 	assert(ctx);
 	if (!ctx) return;
 
+	if (!ctx->ack_sockets.empty()) utp_update_clock(ctx, NULL);
 	for (size_t i = 0; i < ctx->ack_sockets.size(); i++) {
 		UTPSocket *conn = ctx->ack_sockets[i];
 		conn->send_ack();
@@ -3259,7 +3281,7 @@ void utp_check_timeouts(utp_context *ctx)
 	assert(ctx);
 	if (!ctx) return;
 
-	ctx->current_ms = utp_call_get_milliseconds(ctx, NULL);
+	utp_update_clock(ctx, NULL);
 
 	if (ctx->current_ms - ctx->last_check < TIMEOUT_CHECK_INTERVAL)
 		return;
@@ -3343,6 +3365,7 @@ void utp_close(UTPSocket *conn)
 	conn->log(UTP_LOG_DEBUG, "UTP_Close in state:%s", statenames[conn->state]);
 	#endif
 
+	utp_update_clock(conn->ctx, conn);
 	switch(conn->state) {
 	case CS_CONNECTED:
 	case CS_CONNECTED_FULL:
@@ -3351,7 +3374,7 @@ void utp_close(UTPSocket *conn)
 		break;
 
 	case CS_SYN_SENT:
-		conn->rto_timeout = utp_call_get_milliseconds(conn->ctx, conn) + std::min(conn->rto * 2U, 60U);
+		conn->rto_timeout = conn->ctx->current_ms + std::min(conn->rto * 2U, 60U);
 		// fall through
 	case CS_GOT_FIN:
 		conn->state = CS_DESTROY_DELAY;
