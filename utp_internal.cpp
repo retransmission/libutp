@@ -1214,11 +1214,15 @@ void UTPSocket::check_timeouts()
 					// don't set it any lower than the packet size though
 					max_window = std::max<size_t>(max_window * 2 / 3, size_t(packet_size));
 				} else {
-					// our delay was so high that our congestion window
-					// was shrunk below one packet, preventing us from
-					// sending anything for one time-out period. Now, reset
-					// the congestion window to fit one packet, to start over
-					// again
+					// Packets in flight timed out, or delay shrank the window below one
+					// packet. Restart from one packet. Slow start doubles the window, so
+					// stop it at half of what was in flight, as TCP does (RFC 5681). A
+					// repeated timeout of the same packets keeps the ssthresh of the first:
+					// the window is already one packet, and halving that would end the
+					// next slow start after two.
+					if (retransmit_count == 0) {
+						ssthresh = std::max<size_t>(cur_window / 2, 2 * size_t(packet_size));
+					}
 					max_window = packet_size;
 					slow_start = true;
 				}
@@ -1696,14 +1700,25 @@ void UTPSocket::apply_ccontrol(size_t bytes_acked, uint32 actual_delay, int64 mi
 	size_t ledbat_cwnd = (max_window + scaled_gain < MIN_WINDOW_SIZE) ? MIN_WINDOW_SIZE : (size_t)(max_window + scaled_gain);
 
 	if (slow_start) {
-		size_t ss_cwnd = (size_t)(max_window + window_factor*get_packet_size());
-		if (ss_cwnd > ssthresh) {
-			slow_start = false;
-		} else if (our_delay > target*0.9) {
-			// even if we're a little under the target delay, we conservatively
-			// discontinue the slow start phase
+		// TCP-style slow start: the window grows by what was acked, doubling every
+		// round trip until it reaches ssthresh or the delay nears the target. One ACK
+		// can at most double it: a cumulative ACK for a flight sent under a larger
+		// window, as after a timeout, must not jump the window by that flight.
+		// The window grows only while at least half of it is in flight (RFC 7661):
+		// growth while the application or the peer's receive window holds sending
+		// back would open a window the path was never tested at.
+		size_t ss_cwnd = max_window + std::min(bytes_acked, max_window);
+		if (our_delay > target / 4) {
+			// The delay sample lags the queue by a round trip, in which slow start
+			// doubles the window, so the queue is about twice what the sample shows.
+			// Exiting at a quarter of the target keeps that doubling under the target.
 			slow_start = false;
 			ssthresh = max_window;
+		} else if (cur_window * 2 < max_window) {
+			max_window = ledbat_cwnd;
+		} else if (ss_cwnd > ssthresh) {
+			slow_start = false;
+			max_window = std::max(ssthresh, ledbat_cwnd);
 		} else {
 			max_window = std::max(ss_cwnd, ledbat_cwnd);
 		}
@@ -2301,6 +2316,10 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	conn->log(UTP_LOG_DEBUG, "acks:%d acked_bytes:%u seq_nr:%u cur_window:%u cur_window_packets:%u ",
 		acks, (uint)acked_bytes, conn->seq_nr, (uint)conn->cur_window, conn->cur_window_packets);
 	#endif
+
+	// Send the packets queued while the window was full: the ACK made room, and otherwise
+	// they wait for the next write or the next timeout check.
+	if (conn->state != CS_DESTROY) conn->flush_packets();
 
 	// In case the ack dropped the current window below
 	// the max_window size, Mark the socket as writable
