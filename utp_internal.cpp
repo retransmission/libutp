@@ -35,7 +35,13 @@
 #include "utp_packedsockaddr.h"
 #include "utp_internal.h"
 
-#define	TIMEOUT_CHECK_INTERVAL	500
+#define	TIMEOUT_CHECK_INTERVAL	100
+// Lower bound of the retransmission timeout, in ms. TCP's is 200 ms (RFC 6298 allows it); the
+// margin covers an ACK held until the end of the peer's receive batch.
+#define MIN_RTO 250
+// A connection is reset after 4 consecutive timeouts, but not before the backed-off timeout has
+// reached this many ms: about 31 s without an ACK, however low the RTO is.
+#define MIN_GIVE_UP_TIMEOUT 16000
 
 // number of bytes to increase max window size by, per RTT. This is
 // scaled down linearly proportional to off_target. i.e. if all packets
@@ -438,6 +444,10 @@ struct UTPSocket {
 	bool got_fin:1;
 	// Timeout procedure
 	bool fast_timeout:1;
+	// A tail loss probe went out since the peer last acknowledged a packet
+	bool probe_sent:1;
+	// The RTT has been sampled (rtt is 0 on links faster than a millisecond)
+	bool got_rtt:1;
 
 	// max receive window for other end, in bytes
 	size_t max_window_user;
@@ -468,6 +478,10 @@ struct UTPSocket {
 	uint32 reply_micro;
 
 	uint64 last_got_packet;
+	// When the peer last acknowledged a packet, in ms
+	uint64 last_acked;
+	// The latest send time, in microseconds, of a packet the peer has acknowledged
+	uint64 latest_acked_send_time;
 	uint64 last_sent_packet;
 	uint64 last_measured_delay;
 
@@ -600,6 +614,7 @@ struct UTPSocket {
                 return (msec - last_rwin_decay) >= MAX_WINDOW_DECAY;
 	}
 
+	void resend_lost_packets(uint16 reported_end);
 	// If we can, decay max window, returns true if we actually did so
 	void maybe_decay_win(uint64 current_ms)
 	{
@@ -1141,6 +1156,30 @@ void UTPSocket::check_timeouts()
 			max_window_user = PACKET_SIZE;
 		}
 
+		// Tail loss probe. The peer ACKs what arrives, so two round trips without an ACK for
+		// any packet, since the oldest packet in flight went out, mean the last packets, or the
+		// ACKs for them, were lost, and nothing later will arrive to reveal it. Packets from the
+		// peer that acknowledge nothing new do not count. Resending the oldest unacked packet
+		// makes the peer ACK either way: it fills the gap, or the peer already has it and ACKs
+		// again. (A newer packet the peer holds out of order is dropped without an ACK.) That
+		// ACK lets resend_lost_packets() resend the rest, instead of a timeout resending the
+		// whole window from a one-packet window.
+		const uint probe_timeout = 2U * rtt + 10U;
+		if (cur_window_packets > 0 && !probe_sent && got_rtt && state != CS_FIN_SENT
+			&& (int)(ctx->current_ms - rto_timeout) < 0
+			&& ctx->current_ms - last_acked >= probe_timeout) {
+			OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(seq_nr - cur_window_packets);
+			if (pkt != NULL && pkt->transmissions > 0 && !pkt->need_resend
+				&& utp_call_get_microseconds(ctx, this) - pkt->time_sent >= uint64(probe_timeout) * 1000U) {
+				probe_sent = true;
+				log(UTP_LOG_NORMAL, "Tail loss probe. Resend seq_nr:%u", (seq_nr - cur_window_packets) & ACK_NR_MASK);
+				#ifdef _DEBUG
+				++_stats.rexmit;
+				#endif
+				send_packet(pkt);
+			}
+		}
+
 		if ((int)(ctx->current_ms - rto_timeout) >= 0
 			&& rto_timeout > 0) {
 
@@ -1185,10 +1224,11 @@ void UTPSocket::check_timeouts()
 			}
 
 			// We initiated the connection but the other side failed to respond before the rto
-			if (retransmit_count >= 4 || (state == CS_SYN_SENT && retransmit_count >= 2)) {
-				// 4 consecutive transmissions have timed out. Kill it. If we
-				// haven't even connected yet, give up after only 2 consecutive
-				// failed transmissions.
+			if ((retransmit_count >= 4 && retransmit_timeout >= MIN_GIVE_UP_TIMEOUT)
+				|| (state == CS_SYN_SENT && retransmit_count >= 2)) {
+				// 4 consecutive transmissions have timed out, the last after at least
+				// MIN_GIVE_UP_TIMEOUT. Kill it. If we haven't even connected yet, give up
+				// after only 2 consecutive failed transmissions.
 				if (state == CS_FIN_SENT)
 					state = CS_DESTROY;
 				else
@@ -1363,6 +1403,12 @@ int UTPSocket::ack_packet(uint16 seq)
 		seq, (uint)pkt->payload, pkt->need_resend);
 	#endif
 
+	// An ACK that comes less than a round trip after a resend answers an earlier copy, so the
+	// resend's send time says nothing about what the peer has received (RFC 8985, step 2).
+	const uint min_rtt = rtt_hist.delay_base_initialized ? rtt_hist.delay_base : rtt;
+	if (pkt->transmissions == 1
+		|| utp_call_get_microseconds(this->ctx, this) - pkt->time_sent >= uint64(min_rtt) * 1000U)
+		latest_acked_send_time = std::max(latest_acked_send_time, pkt->time_sent);
 	outbuf.put(seq, NULL);
 
 	// if we never re-sent the packet, update the RTT estimate
@@ -1384,7 +1430,8 @@ int UTPSocket::ack_packet(uint16 seq)
 //			assert(rtt < 6000);
 			rtt_hist.add_sample(ertt, ctx->current_ms);
 		}
-		rto = std::max<uint>(rtt + rtt_var * 4U, 1000U);
+		rto = std::max<uint>(rtt + rtt_var * 4U, MIN_RTO);
+		got_rtt = true;
 
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "rtt:%u avg:%u var:%u rto:%u",
@@ -1403,6 +1450,8 @@ int UTPSocket::ack_packet(uint16 seq)
 	}
 	free(pkt);
 	retransmit_count = 0;
+	last_acked = ctx->current_ms;
+	probe_sent = false;
 	return 0;
 }
 
@@ -1433,14 +1482,73 @@ size_t UTPSocket::selective_ack_bytes(uint base, const byte* mask, byte len, int
 		if (bits >= 0 && mask[bits>>3] & (1 << (bits & 7))) {
 			assert((int)(pkt->payload) >= 0);
 			acked_bytes += pkt->payload;
-			if (pkt->time_sent < now)
-				min_rtt = std::min<int64>(min_rtt, now - pkt->time_sent);
-			else
-				min_rtt = std::min<int64>(min_rtt, 50000);
+			// a resent packet's time_sent is its last resend, so the ACK may answer an
+			// earlier copy: only a packet sent once gives a round trip (Karn's rule)
+			if (pkt->transmissions == 1) {
+				if (pkt->time_sent < now)
+					min_rtt = std::min<int64>(min_rtt, now - pkt->time_sent);
+				else
+					min_rtt = std::min<int64>(min_rtt, 50000);
+			}
 			continue;
 		}
 	} while (--bits >= -1);
 	return acked_bytes;
+}
+
+// At most this many lost packets are resent per incoming ACK.
+#define MAX_LOST_RESENDS 16
+
+// A packet the peer has not acknowledged, sent well before one it has, is lost (RACK, RFC
+// 8985). This resends a packet whose later resend is lost, and the rest of a gap after the
+// few packets selective_ack() resends, which would otherwise wait for a timeout. A quarter of
+// the round trip tolerates reordering. A resent packet counts as sent at its resend, so it is
+// resent again only once a packet sent after that resend is acknowledged.
+// Only packets before `reported_end` count: the ACK says nothing of later ones, which may
+// have arrived. A selective ACK covers 30 packets, so a longer gap's tail is resent once a
+// later ACK covers it. An ST_STATE without one covers every packet sent (see utp_process_incoming()).
+void UTPSocket::resend_lost_packets(uint16 reported_end)
+{
+	if (cur_window_packets == 0 || latest_acked_send_time == 0)
+		return;
+
+	const uint16 oldest = (seq_nr - cur_window_packets) & ACK_NR_MASK;
+	const uint16 n_reported = (reported_end - oldest) & ACK_NR_MASK;
+	// none when a reordered ACK ends before the oldest packet in flight
+	const int n = n_reported < 0x8000 ? std::min<int>(cur_window_packets, n_reported) : 0;
+
+	const uint64 reorder_window_us = std::max<uint64>(uint64(rtt) * 1000U / 4U, 1000U);
+	if (latest_acked_send_time < reorder_window_us)
+		return;
+	const uint64 lost_before = latest_acked_send_time - reorder_window_us;
+	int resent = 0;
+	for (int i = 0; i < n && resent < MAX_LOST_RESENDS; ++i) {
+		OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(oldest + i);
+		if (pkt == NULL || pkt->need_resend)
+			continue; // acked, or already queued for resending
+		if (pkt->transmissions == 0)
+			break; // not sent yet
+		if (pkt->time_sent >= lost_before) {
+			// first transmissions go out in sequence order, so later ones are newer still
+			if (pkt->transmissions == 1)
+				break;
+			continue;
+		}
+		const uint16 v = (oldest + i) & ACK_NR_MASK;
+		// used in parse_log.py
+		log(UTP_LOG_NORMAL, "Packet %u lost. Resending", v);
+		#ifdef _DEBUG
+		++_stats.rexmit;
+		#endif
+		send_packet(pkt);
+		++resent;
+		// selective_ack() resends from fast_resend_seq_nr on: not this packet again
+		if (((v - fast_resend_seq_nr) & ACK_NR_MASK) <= OUTGOING_BUFFER_MAX_SIZE)
+			fast_resend_seq_nr = (v + 1) & ACK_NR_MASK;
+	}
+
+	if (resent > 0)
+		maybe_decay_win(ctx->current_ms);
 }
 
 enum { MAX_EACK = 128 };
@@ -1980,11 +2088,16 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 				, conn->mtu_floor, conn->mtu_ceiling, conn->mtu_last);
 		}
 
-		// in case our clock is not monotonic
-		if (pkt->time_sent < now)
-			min_rtt = std::min<int64>(min_rtt, now - pkt->time_sent);
-		else
-			min_rtt = std::min<int64>(min_rtt, 50000);
+		// Only a packet sent once gives a round trip: a resent packet's time_sent is its
+		// last resend, and the ACK may answer an earlier copy (Karn's rule). The delay
+		// estimate is capped at this round trip, so a short one would shift the delay base.
+		if (pkt->transmissions == 1) {
+			// in case our clock is not monotonic
+			if (pkt->time_sent < now)
+				min_rtt = std::min<int64>(min_rtt, now - pkt->time_sent);
+			else
+				min_rtt = std::min<int64>(min_rtt, 50000);
+		}
 	}
 
 	// count bytes acked by EACK
@@ -2293,6 +2406,13 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	if (selack_ptr != NULL) {
 		conn->selective_ack(pk_ack_nr + 2, selack_ptr, selack_ptr[-1]);
 	}
+	// The ACK reports on the packet after pk_ack_nr, and a selective ACK on up to 30 more:
+	// send_ack() fills only 30 of its 32 bits. The peer adds a selective ACK to an ST_STATE
+	// whenever it holds packets out of order, so an ST_STATE without one reports on every
+	// packet sent: none past pk_ack_nr has arrived. Other packets say nothing past pk_ack_nr + 1.
+	const uint16 reported_end = selack_ptr != NULL ? pk_ack_nr + 2 + std::min(selack_ptr[-1] * 8, 30)
+		: pk_flags == ST_STATE ? conn->seq_nr : pk_ack_nr + 2;
+	conn->resend_lost_packets(reported_end);
 
 	// this invariant should always be true
 	assert(conn->cur_window_packets == 0 || conn->outbuf.get(conn->seq_nr - conn->cur_window_packets));
@@ -2588,6 +2708,10 @@ utp_socket*	utp_create_socket(utp_context *ctx)
 	conn->last_rcv_win			= 0;
 	conn->got_fin				= false;
 	conn->fast_timeout			= false;
+	conn->probe_sent			= false;
+	conn->got_rtt				= false;
+	conn->last_acked			= 0;
+	conn->latest_acked_send_time	= 0;
 	conn->rtt					= 0;
 	conn->retransmit_timeout	= 0;
 	conn->rto_timeout			= 0;
@@ -3253,7 +3377,7 @@ void utp_issue_deferred_acks(utp_context *ctx)
 	}
 }
 
-// Should be called every 500ms
+// Should be called every 100ms
 void utp_check_timeouts(utp_context *ctx)
 {
 	assert(ctx);
