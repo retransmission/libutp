@@ -505,6 +505,10 @@ struct UTPSocket {
 	// extension bytes from SYN packet
 	byte extensions[8];
 
+	// flush_packets() starts here: every packet in flight before it has been sent and
+	// is not waiting to be resent. Outside the window it is ignored.
+	uint16 flush_from;
+
 	// MTU Discovery
 	// time when we should restart the MTU discovery
 	uint64 mtu_discover_time;
@@ -962,12 +966,25 @@ bool UTPSocket::flush_packets()
 {
 	size_t packet_size = get_packet_size();
 
+	// Start at flush_from, or at the oldest packet in flight if it is outside the window.
+	// Packets before it need nothing, so a window of sent packets is not scanned again
+	// for every new packet or ACK.
+	const uint16 oldest = (seq_nr - cur_window_packets) & ACK_NR_MASK;
+	uint16 first = oldest;
+	if (((flush_from - oldest) & ACK_NR_MASK) <= cur_window_packets) {
+		first = flush_from;
+	}
+	flush_from = first;
+
 	// send packets that are waiting on the pacer to be sent
 	// i has to be an unsigned 16 bit counter to wrap correctly
 	// signed types are not guaranteed to wrap the way you expect
-	for (uint16 i = seq_nr - cur_window_packets; i != seq_nr; ++i) {
+	for (uint16 i = first; i != seq_nr; ++i) {
 		OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(i);
-		if (pkt == 0 || (pkt->transmissions > 0 && pkt->need_resend == false)) continue;
+		if (pkt == 0 || (pkt->transmissions > 0 && pkt->need_resend == false)) {
+			if (flush_from == i) flush_from = i + 1;
+			continue;
+		}
 		// have we run out of quota?
 		if (is_full()) return true;
 
@@ -978,6 +995,7 @@ bool UTPSocket::flush_packets()
 			cur_window_packets == 1 ||
 			pkt->payload >= packet_size) {
 			send_packet(pkt);
+			if (flush_from == i) flush_from = i + 1;
 		}
 	}
 	return false;
@@ -1108,6 +1126,18 @@ void UTPSocket::check_invariant()
 		outstanding_bytes += pkt->payload;
 	}
 	assert(outstanding_bytes == cur_window);
+
+	// flush_packets() starts at flush_from: every packet before it has been sent and is not
+	// waiting for a resend. A flush_from outside the window means a full scan, and holds nothing.
+	const uint16 oldest = (seq_nr - cur_window_packets) & ACK_NR_MASK;
+	const uint16 flushed = (flush_from - oldest) & ACK_NR_MASK;
+	if (flushed <= cur_window_packets) {
+		for (uint16 i = 0; i < flushed; ++i) {
+			assert(outbuf.get(oldest + i) == NULL
+				|| (((OutgoingPacket*)outbuf.get(oldest + i))->transmissions > 0
+					&& !((OutgoingPacket*)outbuf.get(oldest + i))->need_resend));
+		}
+	}
 }
 #endif
 
@@ -1225,6 +1255,7 @@ void UTPSocket::check_timeouts()
 			}
 
 			// every packet should be considered lost
+			flush_from = seq_nr - cur_window_packets;
 			for (int i = 0; i < cur_window_packets; ++i) {
 				OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(seq_nr - i - 1);
 				if (pkt == 0 || pkt->transmissions == 0 || pkt->need_resend) continue;
@@ -2608,6 +2639,7 @@ utp_socket*	utp_create_socket(utp_context *ctx)
 	conn->ack_nr				= 0;
 	conn->max_window_user		= 255 * PACKET_SIZE;
 	conn->cur_window_packets	= 0;
+	conn->flush_from			= conn->seq_nr;
 	conn->fast_resend_seq_nr	= conn->seq_nr;
 	conn->target_delay			= ctx->target_delay;
 	conn->reply_micro			= 0;
@@ -2762,6 +2794,7 @@ int utp_connect(utp_socket *conn, const struct sockaddr *to, socklen_t tolen)
 	// if you need compatibiltiy with 1.8.1, use this. it increases attackability though.
 	//conn->seq_nr = 1;
 	conn->seq_nr = utp_call_get_random(conn->ctx, conn);
+	conn->flush_from = conn->seq_nr;
 
 	// Create the connect packet.
 	const size_t header_size = sizeof(PacketFormatV1);
@@ -2980,6 +3013,7 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 		utp_initialize_socket(conn, to, tolen, false, id, id+1, id);
 		conn->ack_nr = seq_nr;
 		conn->seq_nr = utp_call_get_random(ctx, NULL);
+		conn->flush_from = conn->seq_nr;
 		conn->fast_resend_seq_nr = conn->seq_nr;
 		conn->state = CS_SYN_RECV;
 
